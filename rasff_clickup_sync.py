@@ -258,4 +258,109 @@ def fetch_notifications(lookback_days: int) -> list[Notification]:
               f"notifications than were fetched. Consider narrowing LOOKBACK_DAYS.")
 
     return [Notification.from_api_record(rec) for rec in all_records]
-    
+
+
+# =============================================================================
+# STEP 2: CLICKUP INTEGRATION
+# =============================================================================
+
+CLICKUP_API_BASE = "https://api.clickup.com/api/v2"
+
+
+def clickup_headers() -> dict:
+    return {"Authorization": CLICKUP_API_TOKEN, "Content-Type": "application/json"}
+
+
+def get_existing_references(list_id: str) -> set[str]:
+    """
+    Pulls task names from the target list and extracts any RASFF reference
+    numbers already present (format: [YYYY.NNNN] at the start of the name),
+    so we don't create duplicate tasks.
+    """
+    refs: set[str] = set()
+    page = 0
+    while True:
+        resp = requests.get(
+            f"{CLICKUP_API_BASE}/list/{list_id}/task",
+            headers=clickup_headers(),
+            params={"page": page, "include_closed": "true"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        tasks = data.get("tasks", [])
+        if not tasks:
+            break
+        for t in tasks:
+            m = re.match(r"^\[([^\]]+)\]", t.get("name", ""))
+            if m:
+                refs.add(m.group(1))
+        if data.get("last_page", True):
+            break
+        page += 1
+    return refs
+
+
+def create_clickup_task(list_id: str, notif: Notification) -> None:
+    priority = 1 if notif.classification.lower().startswith("alert") else 3  # 1=Urgent, 3=Normal
+    tag = re.sub(r"[^a-z0-9]+", "-", notif.hazard_text.lower()).strip("-")[:50]
+    payload = {
+        "name": notif.clickup_task_name(),
+        "description": notif.clickup_description(),
+        "tags": [tag] if tag else [],
+        "priority": priority,
+    }
+    resp = requests.post(
+        f"{CLICKUP_API_BASE}/list/{list_id}/task",
+        headers=clickup_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        print(f"ERROR creating task for {notif.reference}: {resp.status_code} {resp.text}")
+    else:
+        print(f"Created ClickUp task for {notif.reference}: {notif.subject[:60]}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+
+def main() -> int:
+    if not CLICKUP_API_TOKEN or not CLICKUP_LIST_ID:
+        print("ERROR: set CLICKUP_API_TOKEN and CLICKUP_LIST_ID environment variables.")
+        return 1
+
+    print(f"Fetching RASFF notifications from the last {LOOKBACK_DAYS} day(s)...")
+    notifications = fetch_notifications(LOOKBACK_DAYS)
+    print(f"Found {len(notifications)} notifications in the search window.")
+
+    matches = []
+    for n in notifications:
+        hit_keywords = n.matches_keywords(KEYWORDS)
+        if hit_keywords:
+            matches.append((n, hit_keywords))
+
+    print(f"{len(matches)} matched your keyword filters.")
+    if not matches:
+        return 0
+
+    existing_refs = get_existing_references(CLICKUP_LIST_ID)
+    print(f"{len(existing_refs)} notifications already tracked in ClickUp.")
+
+    created = 0
+    for notif, hit_keywords in matches:
+        if notif.reference in existing_refs:
+            continue
+        print(f"  -> {notif.reference}: matched on {hit_keywords}")
+        create_clickup_task(CLICKUP_LIST_ID, notif)
+        created += 1
+        time.sleep(0.5)  # be polite to ClickUp's rate limits
+
+    print(f"Done. Created {created} new task(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
