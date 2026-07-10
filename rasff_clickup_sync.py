@@ -1,9 +1,10 @@
 """
 RASFF Window -> ClickUp sync.
 
-Scrapes recent notifications from RASFF Window (public EU food/feed safety
-alert database), filters them down to what's actually relevant to your
-business using keyword rules, and creates a ClickUp task for each new match.
+Fetches recent notifications from RASFF Window's real search/export API
+(discovered via browser DevTools - see below), filters them down to what's
+actually relevant to your business using keyword rules, and creates a
+ClickUp task for each new match.
 
 Dedup strategy: before creating a task, we check existing tasks in the target
 ClickUp list for the RASFF reference number (stored in the task name). This
@@ -14,21 +15,24 @@ a persisted database.
 SETUP
 -----------------------------------------------------------------------------
 1. pip install -r requirements.txt
-2. playwright install chromium
-3. Set environment variables (or edit CONFIG below directly):
+2. Set environment variables (or edit CONFIG below directly):
      CLICKUP_API_TOKEN   - your personal ClickUp API token
      CLICKUP_LIST_ID     - the ClickUp list to create tasks in
-4. Edit KEYWORDS below to match your actual exposure (ingredients, hazards,
+3. Edit KEYWORDS below to match your actual exposure (ingredients, hazards,
    countries). Keep this list tight - it's your main defense against noise.
-5. Run: python rasff_clickup_sync.py
+4. Run: python rasff_clickup_sync.py
 
 -----------------------------------------------------------------------------
-IF YOU LATER GET THE REAL RASFF API ENDPOINT
+ABOUT THE RASFF ENDPOINT
 -----------------------------------------------------------------------------
-Grab the request via browser DevTools (Network tab -> XHR/Fetch -> copy as
-cURL) while performing a search on https://webgate.ec.europa.eu/rasff-window/screen/search
-and swap out `fetch_notifications_via_browser()` for a plain `requests.get(...)`
-call. That'll be faster and won't need a browser at all.
+This calls RASFF Window's own backend search endpoint directly (the same one
+the website's search/export buttons use), found via browser DevTools:
+
+  POST https://webgate.ec.europa.eu/rasff-window/backend/public/notification/search/export/en/
+
+It's not formally documented as a public API, so if the EU changes it, this
+will start failing loudly (non-200 response / unexpected JSON shape) rather
+than silently - the error handling below is written to make that obvious.
 -----------------------------------------------------------------------------
 """
 
@@ -36,12 +40,11 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
-from playwright.sync_api import sync_playwright
 
 # =============================================================================
 # CONFIG - this is the part you should tune for your business
@@ -55,12 +58,16 @@ CLICKUP_LIST_ID = os.environ.get("CLICKUP_LIST_ID", "")
 # lose notifications.
 LOOKBACK_DAYS = 3
 
-RASFF_SEARCH_URL = "https://webgate.ec.europa.eu/rasff-window/screen/search"
+RASFF_SEARCH_PAGE_URL = "https://webgate.ec.europa.eu/rasff-window/screen/search"
+RASFF_EXPORT_API_URL = (
+    "https://webgate.ec.europa.eu/rasff-window/backend/public/notification/search/export/en/"
+)
+RASFF_ITEMS_PER_PAGE = 500  # comfortably above expected daily/weekly volume
 
 # Keywords are matched case-insensitively against the notification's subject,
-# product category, and hazard category text. A notification is a match if
-# ANY keyword group below matches. Keep groups narrow and specific rather
-# than broad, or you'll get flooded.
+# product category, product type, and hazard text. A notification is a match
+# if ANY keyword matches. Keep this narrow and specific, or you'll get
+# flooded.
 #
 # Tuned to EarthChimp's actual exposure: heavy metals in protein/cocoa,
 # your specific ingredient suppliers/origins, and allergens you declare.
@@ -84,20 +91,57 @@ KEYWORDS = [
 # =============================================================================
 
 
+def _get(d: dict, *path, default=""):
+    """Safely walk a nested dict, returning `default` if any key is missing."""
+    cur = d
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur if cur is not None else default
+
+
 @dataclass
 class Notification:
     reference: str
     date: str
     subject: str
     product_category: str = ""
-    hazard_category: str = ""
+    product_type: str = ""
+    hazard_text: str = ""
     notifying_country: str = ""
     classification: str = ""  # e.g. "Alert", "Information", "Border Rejection"
-    url: str = ""
+    notif_id: str = ""
+
+    @property
+    def url(self) -> str:
+        if self.notif_id:
+            return f"https://webgate.ec.europa.eu/rasff-window/screen/notification/{self.notif_id}"
+        return RASFF_SEARCH_PAGE_URL
+
+    @classmethod
+    def from_api_record(cls, rec: dict) -> "Notification":
+        hazards = rec.get("hazards") or []
+        if isinstance(hazards, list):
+            hazard_text = "; ".join(str(h) for h in hazards)
+        else:
+            hazard_text = str(hazards)
+
+        return cls(
+            reference=str(_get(rec, "reference")),
+            date=str(_get(rec, "ecValidationDate")),
+            subject=str(_get(rec, "subject")),
+            product_category=str(_get(rec, "productCategory", "description")),
+            product_type=str(_get(rec, "productType", "description")),
+            hazard_text=hazard_text,
+            notifying_country=str(_get(rec, "notifyingCountry", "organizationName")),
+            classification=str(_get(rec, "notificationClassification", "description")),
+            notif_id=str(_get(rec, "notifId")),
+        )
 
     def matches_keywords(self, keywords: list[str]) -> list[str]:
         haystack = " ".join(
-            [self.subject, self.product_category, self.hazard_category]
+            [self.subject, self.product_category, self.product_type, self.hazard_text]
         ).lower()
         return [kw for kw in keywords if kw.lower() in haystack]
 
@@ -110,77 +154,101 @@ class Notification:
             f"**Date:** {self.date}\n"
             f"**Classification:** {self.classification}\n"
             f"**Product category:** {self.product_category}\n"
-            f"**Hazard category:** {self.hazard_category}\n"
+            f"**Product type:** {self.product_type}\n"
+            f"**Hazard:** {self.hazard_text}\n"
             f"**Notifying country:** {self.notifying_country}\n\n"
             f"**Link:** {self.url}\n"
         )
 
 
 # =============================================================================
-# STEP 1: FETCH NOTIFICATIONS FROM RASFF WINDOW
+# STEP 1: FETCH NOTIFICATIONS FROM RASFF WINDOW'S SEARCH API
 # =============================================================================
 
 
-def fetch_notifications_via_browser(lookback_days: int) -> list[Notification]:
+def fetch_notifications(lookback_days: int) -> list[Notification]:
     """
-    Loads the RASFF Window search UI in a headless browser, runs a search for
-    the lookback window, and scrapes the results table.
-
-    NOTE: This relies on the current DOM structure of RASFF Window
-    (webgate.ec.europa.eu/rasff-window/screen/search). If the EU updates the
-    site layout, the CSS selectors below will need adjusting - run with
-    headless=False locally to see what changed.
+    Calls RASFF Window's own search/export backend endpoint directly (found
+    via browser DevTools network inspection - see module docstring).
     """
-    date_from = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
+    date_from = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%d-%m-%Y 00:00:00")
+    date_to = datetime.utcnow().strftime("%d-%m-%Y 23:59:59")
 
-    notifications: list[Notification] = []
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; EarthChimpRasffSync/1.0; "
+                "+https://github.com/) requests-python"
+            ),
+            "X-Requested-With": "XMLHttpRequest",
+        }
+    )
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(RASFF_SEARCH_URL, wait_until="networkidle", timeout=60000)
+    # Visit the search page first so the server can set session cookies -
+    # mirrors what a real browser does before calling the export endpoint.
+    try:
+        session.get(RASFF_SEARCH_PAGE_URL, timeout=30)
+    except requests.RequestException as e:
+        print(f"WARNING: could not pre-load search page for cookies ({e}). Continuing anyway.")
 
-        # --- Fill in the date range and trigger search ---
-        # These selectors are best-effort placeholders based on the public
-        # RASFF Window layout. Adjust after inspecting the live page
-        # (right-click a field -> Inspect) if they don't match.
-        try:
-            page.fill('input[name="dateFrom"]', date_from)
-            page.fill('input[name="dateTo"]', date_to)
-            page.click('button:has-text("Search")')
-            page.wait_for_selector("table tbody tr", timeout=30000)
-        except Exception as e:
-            print(f"WARNING: could not drive search form as expected ({e}). "
-                  f"Falling back to scraping whatever is currently loaded.")
+    payload = {
+        "parameters": {"pageNumber": 1, "itemsPerPage": RASFF_ITEMS_PER_PAGE},
+        "notificationReference": None,
+        "subject": None,
+        "ecValidDateFrom": date_from,
+        "ecValidDateTo": date_to,
+        "notifyingCountry": None,
+        "originCountry": None,
+        "distributionCountry": None,
+        "notificationType": None,
+        "notificationStatus": None,
+        "notificationClassification": None,
+        "notificationBasis": None,
+        "productCategory": None,
+        "actionTaken": None,
+        "hazardCategory": None,
+        "riskDecision": None,
+    }
 
-        rows = page.query_selector_all("table tbody tr")
-        for row in rows:
-            cells = [c.inner_text().strip() for c in row.query_selector_all("td")]
-            if len(cells) < 4:
-                continue
-            link_el = row.query_selector("a")
-            href = link_el.get_attribute("href") if link_el else ""
-            full_url = href if href.startswith("http") else f"https://webgate.ec.europa.eu{href}"
+    resp = session.post(RASFF_EXPORT_API_URL, json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"RASFF API returned HTTP {resp.status_code}. "
+            f"The endpoint may have changed - check response body:\n{resp.text[:1000]}"
+        )
 
-            # Column order varies - this is a best-effort mapping. Print
-            # `cells` once locally to confirm/adjust the indices for your view.
-            notif = Notification(
-                reference=cells[0] if len(cells) > 0 else "",
-                date=cells[1] if len(cells) > 1 else "",
-                classification=cells[2] if len(cells) > 2 else "",
-                subject=cells[3] if len(cells) > 3 else "",
-                product_category=cells[4] if len(cells) > 4 else "",
-                hazard_category=cells[5] if len(cells) > 5 else "",
-                notifying_country=cells[6] if len(cells) > 6 else "",
-                url=full_url,
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"RASFF API did not return valid JSON (endpoint may have changed): {e}\n"
+            f"Response body starts with: {resp.text[:500]}"
+        )
+
+    # The response shape wasn't fully confirmed during development - handle
+    # a plain list or a few likely wrapper-key variants, and fail loudly with
+    # a clear message if none match, rather than silently returning nothing.
+    if isinstance(data, list):
+        records = data
+    elif isinstance(data, dict):
+        records = None
+        for key in ("content", "items", "results", "data", "notifications"):
+            if key in data and isinstance(data[key], list):
+                records = data[key]
+                break
+        if records is None:
+            raise RuntimeError(
+                f"RASFF API returned an unexpected JSON shape (dict with keys: "
+                f"{list(data.keys())}). Update fetch_notifications() to match. "
+                f"First 500 chars: {str(data)[:500]}"
             )
-            if notif.reference:
-                notifications.append(notif)
+    else:
+        raise RuntimeError(f"RASFF API returned unexpected JSON type: {type(data)}")
 
-        browser.close()
-
-    return notifications
+    return [Notification.from_api_record(rec) for rec in records]
 
 
 # =============================================================================
@@ -217,72 +285,3 @@ def get_existing_references(list_id: str) -> set[str]:
         for t in tasks:
             m = re.match(r"^\[([^\]]+)\]", t.get("name", ""))
             if m:
-                refs.add(m.group(1))
-        if data.get("last_page", True):
-            break
-        page += 1
-    return refs
-
-
-def create_clickup_task(list_id: str, notif: Notification) -> None:
-    priority = 1 if notif.classification.lower().startswith("alert") else 3  # 1=Urgent, 3=Normal
-    payload = {
-        "name": notif.clickup_task_name(),
-        "description": notif.clickup_description(),
-        "tags": [t for t in [notif.hazard_category.lower().replace(" ", "-")] if t],
-        "priority": priority,
-    }
-    resp = requests.post(
-        f"{CLICKUP_API_BASE}/list/{list_id}/task",
-        headers=clickup_headers(),
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code >= 300:
-        print(f"ERROR creating task for {notif.reference}: {resp.status_code} {resp.text}")
-    else:
-        print(f"Created ClickUp task for {notif.reference}: {notif.subject[:60]}")
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-
-def main() -> int:
-    if not CLICKUP_API_TOKEN or not CLICKUP_LIST_ID:
-        print("ERROR: set CLICKUP_API_TOKEN and CLICKUP_LIST_ID environment variables.")
-        return 1
-
-    print(f"Fetching RASFF notifications from the last {LOOKBACK_DAYS} day(s)...")
-    notifications = fetch_notifications_via_browser(LOOKBACK_DAYS)
-    print(f"Found {len(notifications)} notifications in the search window.")
-
-    matches = []
-    for n in notifications:
-        hit_keywords = n.matches_keywords(KEYWORDS)
-        if hit_keywords:
-            matches.append((n, hit_keywords))
-
-    print(f"{len(matches)} matched your keyword filters.")
-    if not matches:
-        return 0
-
-    existing_refs = get_existing_references(CLICKUP_LIST_ID)
-    print(f"{len(existing_refs)} notifications already tracked in ClickUp.")
-
-    created = 0
-    for notif, hit_keywords in matches:
-        if notif.reference in existing_refs:
-            continue
-        print(f"  -> {notif.reference}: matched on {hit_keywords}")
-        create_clickup_task(CLICKUP_LIST_ID, notif)
-        created += 1
-        time.sleep(0.5)  # be polite to ClickUp's rate limits
-
-    print(f"Done. Created {created} new task(s).")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
